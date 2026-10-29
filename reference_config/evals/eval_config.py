@@ -13636,26 +13636,90 @@ _eval_config_list = [
 #     only 7 trials per node.
 #   Terminal-Bench 4.0: task-declared (mostly 2-4 CPUs, a few 8-16); the 40
 #     largest need ~170 CPUs.
-#   tau3-bench (4 CPU / 8 GiB + tau3-runtime sidecar): ~35-40 fit; 32.
-#   SWE-bench Verified (1 CPU / 4 GiB, task default): 62. Its test runs already
-#     drive the pool to ~100% CPU, so more trials would mostly slow them.
 _MINIMAX_M31_FLASH_CONCURRENT_TRIALS = {
     "terminal_bench_2_1": 62,
     "terminal_bench_4": 40,
-    "tau3_bench_banking": 32,
-    "swe_bench_verified": 62,
 }
 # Tasks that run with each task's declared CPU and memory instead of M3's override.
 _MINIMAX_M31_FLASH_TASK_DECLARED_RESOURCES = {"terminal_bench_2_1"}
 
 
 # MiniMax-M3.1-Flash: same architecture, tokenizer and chat template as M3, so
-# reuse all of M3's task definitions (GPQA, LongBench v2, Terminal-Bench 2.1 and
-# 4.0, AutomationBench, tau3-bench, SWE-bench Verified). No targets yet: the
-# M3.1-Flash eval set and its GPU reference runs aren't confirmed, so scores are
-# measurements only (no published, GPU or limit-mode references; the card's
-# AutomationBench 62.8 states no harness or effort).
+# its tasks in the eval plan of record (#5470) are M3's, plus DeepSWE: GPQA,
+# LongBench v2, Terminal-Bench 2.1 and 4.0, AutomationBench. Published scores
+# are the model card's where it reports the benchmark (not GPQA, LongBench v2 or
+# Terminal-Bench 2.1; the card's Terminal-Bench 4.0 ran Codex, here terminus-2).
+# GPU references are the SGLang runs in #5470.
+_MINIMAX_M31_FLASH_CARD = "https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash"
+_MINIMAX_M31_FLASH_PUBLISHED = {
+    # 600 publicly released tasks.
+    "automation_bench": 62.8,
+    "terminal_bench_4": 38.1,
+    "deepswe": 73.7,
+}
+_MINIMAX_M31_FLASH_GPU_REFERENCE = {
+    "r1_gpqa_diamond": (
+        87.88,
+        "https://github.com/tenstorrent/tt-inference-server/issues/5470#issuecomment-6466031915",
+    ),
+    "longbench2_generate": (
+        63.49,
+        "https://github.com/tenstorrent/tt-inference-server/issues/5470#issuecomment-6466031915",
+    ),
+    "automation_bench": (
+        61.33,
+        "https://github.com/tenstorrent/tt-inference-server/issues/5470#issuecomment-6446885867",
+    ),
+}
+_MINIMAX_M31_FLASH_M3_TASKS = (
+    "r1_gpqa_diamond",
+    "longbench2_generate",
+    "terminal_bench_2_1",
+    "terminal_bench_4",
+    "automation_bench",
+)
+# Without an effort the chat template leaves thinking "adaptive". SGLang maps a
+# request's reasoning_effort onto the template's <effort> tag.
+_MINIMAX_M31_FLASH_REASONING_EFFORT = "max"
+
+
+def _minimax_m31_flash_score(task_name: str, score: "EvalTaskScore") -> "EvalTaskScore":
+    published = _MINIMAX_M31_FLASH_PUBLISHED.get(task_name)
+    gpu_reference, gpu_reference_ref = _MINIMAX_M31_FLASH_GPU_REFERENCE.get(
+        task_name, (None, None)
+    )
+    return replace(
+        score,
+        published_score=published,
+        published_score_ref=_MINIMAX_M31_FLASH_CARD if published else None,
+        gpu_reference_score=gpu_reference,
+        gpu_reference_score_ref=gpu_reference_ref,
+        mode_reference_scores={},
+    )
+
+
 def _minimax_m31_flash_task(task: "EvalTask") -> "EvalTask":
+    if task.task_name == "automation_bench":
+        # auto-bench takes the effort as --reasoning-effort (request_body is
+        # not wired for it).
+        task = replace(
+            task,
+            agentic_eval_config=replace(
+                task.agentic_eval_config,
+                agent_kwargs={
+                    **task.agentic_eval_config.agent_kwargs,
+                    "reasoning_effort": _MINIMAX_M31_FLASH_REASONING_EFFORT,
+                },
+            ),
+        )
+    else:
+        task = replace(
+            task,
+            request_body={
+                **task.request_body,
+                "reasoning_effort": _MINIMAX_M31_FLASH_REASONING_EFFORT,
+            },
+        )
     concurrency = _MINIMAX_M31_FLASH_CONCURRENT_TRIALS.get(task.task_name)
     if concurrency is not None:
         task = replace(
@@ -13671,17 +13735,7 @@ def _minimax_m31_flash_task(task: "EvalTask") -> "EvalTask":
                 task.agentic_eval_config, override_cpus=None, override_memory_mb=None
             ),
         )
-    return replace(
-        task,
-        score=replace(
-            task.score,
-            published_score=None,
-            published_score_ref=None,
-            gpu_reference_score=None,
-            gpu_reference_score_ref=None,
-            mode_reference_scores={},
-        ),
-    )
+    return replace(task, score=_minimax_m31_flash_score(task.task_name, task.score))
 
 
 _eval_config_list.append(
@@ -13692,6 +13746,72 @@ _eval_config_list.append(
             for config in _eval_config_list
             if config.hf_model_repo == "MiniMaxAI/MiniMax-M3"
             for task in config.tasks
+            if task.task_name in _MINIMAX_M31_FLASH_M3_TASKS
+        ]
+        + [
+            EvalTask(
+                task_name="deepswe",
+                workflow_venv_type=WorkflowVenvType.EVALS_AGENTIC,
+                # Reaches mini-swe-agent's model_kwargs.extra_body.
+                request_body={"reasoning_effort": _MINIMAX_M31_FLASH_REASONING_EFFORT},
+                score=_minimax_m31_flash_score(
+                    "deepswe",
+                    EvalTaskScore(
+                        published_score=None,
+                        published_score_ref=None,
+                        score_func=score_task_single_key,
+                        score_func_kwargs={
+                            "result_keys": ["accuracy"],
+                            "unit": "percent",
+                        },
+                    ),
+                ),
+                agentic_eval_config=HarborEvalConfig(
+                    # Checked out from datacurve-ai/deep-swe at v1.1 (see
+                    # llm_module/agentic/deepswe.py); not a registry dataset.
+                    dataset="datacurve/deep-swe",
+                    # The DeepSWE leaderboard runs every model with mini-swe-agent.
+                    agent="mini-swe-agent",
+                    # Tasks block agent egress; let the agent reach the server.
+                    allow_agent_endpoint=True,
+                    # Agent-side test runs and the grader both run jest/vitest.
+                    environment_env=dict(DEEPSWE_TEST_WORKER_ENV),
+                    verifier_env=dict(DEEPSWE_TEST_WORKER_ENV),
+                    n_concurrent_trials=62,
+                    n_attempts=1,
+                    n_tasks=None,
+                    # None keeps each task's own 3h agent timeout.
+                    agent_timeout_sec=None,
+                    agent_kwargs={
+                        # The M3.1-Flash card's DeepSWE v1.1 harness:
+                        # mini-SWE-agent 2.4.5 at 512K context (the server's
+                        # limit; mini-swe-agent has no input cap of its own).
+                        "version": "2.4.5",
+                        "max_tokens": 64 * 1024,
+                        "config": {
+                            "model": {
+                                "model_kwargs": {
+                                    "temperature": 1.0,
+                                    "top_p": 0.95,
+                                }
+                            }
+                        },
+                    },
+                    task_names_map={
+                        # One task per language family: Go, Python,
+                        # TypeScript, Rust.
+                        EvalLimitMode.CI_NIGHTLY: [
+                            "abs-module-cache-flags",
+                            "httpx-streaming-json-iteration",
+                            "ts-pattern-match-each",
+                            "wasmi-trap-coredumps",
+                        ],
+                    },
+                ),
+                limit_samples_map={
+                    EvalLimitMode.SMOKE_TEST: 1,
+                },
+            ),
         ],
     )
 )
